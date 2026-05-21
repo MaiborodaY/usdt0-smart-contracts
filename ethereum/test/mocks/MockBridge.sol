@@ -28,6 +28,7 @@ contract MockBridge {
     uint256 public lastDestinationChainId;
     string  public lastDestinationAddress;
     uint256 public lastOperationId;
+    bytes   public lastSettlementData;
     uint256 public lastMsgValue;
     address public lastCaller;
 
@@ -42,13 +43,14 @@ contract MockBridge {
     /// @notice Mirrors the adapter-only overload
     ///         `Bridge.fundsIn(uint256 amount, uint256 sourceChainId,
     ///                         uint256 destinationChainId, string destinationAddress,
-    ///                         uint256 operationId)`.
+    ///                         uint256 operationId, bytes settlementData)`.
     function fundsIn(
         uint256 amount,
         uint256 sourceChainId,
         uint256 destinationChainId,
         string  calldata destinationAddress,
-        uint256 operationId
+        uint256 operationId,
+        bytes   calldata settlementData
     ) external payable {
         require(!reverts, 'MockBridge: forced revert');
 
@@ -59,6 +61,7 @@ contract MockBridge {
         lastDestinationChainId = destinationChainId;
         lastDestinationAddress = destinationAddress;
         lastOperationId        = operationId;
+        lastSettlementData     = settlementData;
         lastMsgValue           = msg.value;
         lastCaller             = msg.sender;
     }
