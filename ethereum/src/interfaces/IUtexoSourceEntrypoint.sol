@@ -17,11 +17,16 @@ interface IUtexoSourceEntrypoint {
     ///                     gas budgets and the destination-side `msg.value` forwarded
     ///                     into `UtexoLZAdapter.lzCompose`. Produced by the backend.
     /// @param payload      Caller-supplied business payload encoded as
-    ///                     `abi.encode(uint256 destinationChainId, string destinationAddress, uint256 operationId)`.
-    ///                     The entrypoint decodes it on the source chain to validate
-    ///                     the format (malformed input reverts here, before any LZ fee
-    ///                     is paid) and re-encodes it with `block.chainid` prepended
-    ///                     as the actual `composeMsg` forwarded to LayerZero.
+    ///                     `abi.encode(uint256 destinationChainId, string destinationAddress, uint256 operationId, bytes settlementData)`.
+    ///                     `settlementData` is an opaque blob consumed by the
+    ///                     destination route's `SettlementModule` on Arbitrum
+    ///                     (empty `""` for routes registered with
+    ///                     `NullSettlementModule`, which is the default for
+    ///                     LZ-adapter flows). The entrypoint decodes the payload
+    ///                     on the source chain to validate the format (malformed
+    ///                     input reverts here, before any LZ fee is paid) and
+    ///                     re-encodes it with `block.chainid` prepended as the
+    ///                     actual `composeMsg` forwarded to LayerZero.
     struct DepositParams {
         uint256 amountLD;
         uint256 minAmountLD;
@@ -58,7 +63,12 @@ interface IUtexoSourceEntrypoint {
     /// @param destinationChainId  Final destination chain id (`uint256`; passes through
     ///                            to Bridge unchanged).
     /// @param destinationAddress  Final recipient address on `destinationChainId`.
-    /// @param operationId         Backend-assigned operation id (replay guard on Bridge).
+    /// @param operationId         Backend-assigned operation id (consumed by the
+    ///                            destination route's settlement module on Bridge).
+    /// @param settlementData      Opaque blob plumbed through to
+    ///                            `Bridge.fundsIn` and into the destination
+    ///                            route's `SettlementModule.onFundsIn`. Empty
+    ///                            for routes using `NullSettlementModule`.
     event Deposit(
         bytes32 indexed guid,
         address indexed user,
@@ -66,7 +76,8 @@ interface IUtexoSourceEntrypoint {
         uint256 sourceChainId,
         uint256 destinationChainId,
         string  destinationAddress,
-        uint256 operationId
+        uint256 operationId,
+        bytes   settlementData
     );
 
     // =========================================================================
