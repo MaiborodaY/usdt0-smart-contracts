@@ -13,7 +13,7 @@ import { IERC20 } from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 ///         `UtexoLZAdapter.lzCompose` invokes. Not declared as `IBridge` —
 ///         Solidity dispatches by selector at runtime, so a matching function
 ///         signature on this stub is sufficient. The full upstream `IBridge`
-///         lives in the utexo-smart-contracts submodule and would require
+///         lives in the bridge-smart-contracts submodule and would require
 ///         stubbing many unrelated members (`fundsOut`, `setLZAdapter`, …)
 ///         that the adapter never calls in tests.
 contract MockBridge {
@@ -28,6 +28,7 @@ contract MockBridge {
     uint256 public lastDestinationChainId;
     string  public lastDestinationAddress;
     uint256 public lastOperationId;
+    bytes   public lastSettlementData;
     uint256 public lastMsgValue;
     address public lastCaller;
 
@@ -42,13 +43,14 @@ contract MockBridge {
     /// @notice Mirrors the adapter-only overload
     ///         `Bridge.fundsIn(uint256 amount, uint256 sourceChainId,
     ///                         uint256 destinationChainId, string destinationAddress,
-    ///                         uint256 operationId)`.
+    ///                         uint256 operationId, bytes settlementData)`.
     function fundsIn(
         uint256 amount,
         uint256 sourceChainId,
         uint256 destinationChainId,
         string  calldata destinationAddress,
-        uint256 operationId
+        uint256 operationId,
+        bytes   calldata settlementData
     ) external payable {
         require(!reverts, 'MockBridge: forced revert');
 
@@ -59,6 +61,7 @@ contract MockBridge {
         lastDestinationChainId = destinationChainId;
         lastDestinationAddress = destinationAddress;
         lastOperationId        = operationId;
+        lastSettlementData     = settlementData;
         lastMsgValue           = msg.value;
         lastCaller             = msg.sender;
     }

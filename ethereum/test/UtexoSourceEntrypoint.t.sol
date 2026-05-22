@@ -21,7 +21,8 @@ contract UtexoSourceEntrypointTest is Test {
         uint256 sourceChainId,
         uint256 destinationChainId,
         string  destinationAddress,
-        uint256 operationId
+        uint256 operationId,
+        bytes   settlementData
     );
 
     // -- Business payload constants (entrypoint decodes these from `payload`) --
@@ -30,6 +31,10 @@ contract UtexoSourceEntrypointTest is Test {
     uint256 constant DEST_CHAIN_ID = 1_000_001;
     string  constant DEST_ADDR     = 'tb1q-dest-addr';
     uint256 constant OPERATION_ID  = 42;
+    /// @dev Default settlementData for LZ-adapter flows: the route is registered
+    ///      with `NullSettlementModule` on the destination side, so the blob is
+    ///      empty. Non-empty values are exercised in `test_deposit_settlementData_roundTrips`.
+    bytes   constant EMPTY_SETTLEMENT_DATA = '';
 
     // -- Constants ------------------------------------------------------------
     uint32  constant DST_EID = 30110; // Arbitrum LayerZero eid
@@ -111,7 +116,8 @@ contract UtexoSourceEntrypointTest is Test {
             block.chainid,
             DEST_CHAIN_ID,
             DEST_ADDR,
-            OPERATION_ID
+            OPERATION_ID,
+            EMPTY_SETTLEMENT_DATA
         );
 
         bytes32 guid = entrypoint.deposit{ value: NATIVE_FEE }(p);
@@ -131,7 +137,7 @@ contract UtexoSourceEntrypointTest is Test {
 
         // Entrypoint rewrote `composeMsg` with `block.chainid` prepended.
         bytes memory expectedComposeMsg = abi.encode(
-            block.chainid, DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID
+            block.chainid, DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, EMPTY_SETTLEMENT_DATA
         );
         assertEq(oft.lastComposeMsg(), expectedComposeMsg, 'composeMsg = chainid + business');
 
@@ -168,7 +174,7 @@ contract UtexoSourceEntrypointTest is Test {
             amountLD:     42e6,
             minAmountLD:  42e6,
             extraOptions: extra,
-            payload:      abi.encode(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID)
+            payload:      abi.encode(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, EMPTY_SETTLEMENT_DATA)
         });
 
         vm.startPrank(user);
@@ -180,7 +186,41 @@ contract UtexoSourceEntrypointTest is Test {
         assertEq(oft.lastOftCmd().length, 0,     'oftCmd is always empty');
     }
 
-    /// @dev A malformed `payload` (cannot decode as (uint256, string, uint256))
+    /// @dev Non-empty `settlementData` must round-trip byte-for-byte through the
+    ///      payload → composeMsg pipeline so the destination route's
+    ///      `SettlementModule.onFundsIn` sees exactly what the caller intended.
+    ///      LZ-adapter flows default to empty data (NullSettlementModule), but
+    ///      future routes (or future settlement modules) may consume a non-empty
+    ///      blob and the entrypoint must not lose or mangle it.
+    function test_deposit_settlementData_roundTrips() public {
+        bytes memory blob = hex'deadbeefcafebabe1122334455667788';
+        IUtexoSourceEntrypoint.DepositParams memory p = IUtexoSourceEntrypoint.DepositParams({
+            amountLD:     7e6,
+            minAmountLD:  7e6,
+            extraOptions: hex'0003',
+            payload:      abi.encode(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, blob)
+        });
+
+        vm.startPrank(user);
+        token.approve(address(entrypoint), p.amountLD);
+
+        vm.expectEmit(true, true, false, true, address(entrypoint));
+        emit Deposit(
+            keccak256(abi.encode('mock-guid', uint64(1))),
+            user, p.amountLD, block.chainid,
+            DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, blob
+        );
+
+        entrypoint.deposit{ value: NATIVE_FEE }(p);
+        vm.stopPrank();
+
+        bytes memory expectedComposeMsg = abi.encode(
+            block.chainid, DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, blob
+        );
+        assertEq(oft.lastComposeMsg(), expectedComposeMsg, 'composeMsg carries settlementData');
+    }
+
+    /// @dev A malformed `payload` (cannot decode as (uint256, string, uint256, bytes))
     ///      must revert on the source chain, before the OFT pulls tokens or the
     ///      caller pays an LZ fee — preventing un-decodable composeMsgs from
     ///      ever being delivered to `UtexoLZAdapter.lzCompose`.
@@ -189,7 +229,7 @@ contract UtexoSourceEntrypointTest is Test {
             amountLD:     10e6,
             minAmountLD:  10e6,
             extraOptions: hex'0003',
-            payload:      hex'01020304' // 4 bytes — too short to decode three dynamic fields
+            payload:      hex'01020304' // 4 bytes — too short to decode four dynamic fields
         });
 
         vm.startPrank(user);
@@ -298,7 +338,7 @@ contract UtexoSourceEntrypointTest is Test {
             amountLD:     amount,
             minAmountLD:  amount,
             extraOptions: hex'0003',                 // arbitrary non-empty
-            payload:      abi.encode(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID)
+            payload:      abi.encode(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, EMPTY_SETTLEMENT_DATA)
         });
     }
 }

@@ -13,7 +13,7 @@ import { IOFT, SendParam }                  from '@layerzerolabs/lz-evm-oapp-v2/
 import { MessagingFee, MessagingReceipt }   from '@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol';
 
 import { IUtexoLZAdapter } from './interfaces/IUtexoLZAdapter.sol';
-import { IBridge }         from '@utexo-smart-contracts/interfaces/IBridge.sol';
+import { IBridge }         from '@bridge-smart-contracts/interfaces/IBridge.sol';
 
 /// @title UtexoLZAdapter
 /// @notice Bidirectional adapter between the Utexo `Bridge` (on Arbitrum) and the
@@ -175,13 +175,18 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
 
         // 3. Decode the business payload. `sourceChainId` is the EVM chain id
         //    captured by `UtexoSourceEntrypoint` from `block.chainid` at deposit
-        //    time — non-spoofable.
+        //    time — non-spoofable. `settlementData` is an opaque blob whose
+        //    layout is dictated by the destination route's `SettlementModule`
+        //    on Arbitrum; the adapter plumbs it through unchanged. For routes
+        //    registered with `NullSettlementModule` (the default for
+        //    LZ-adapter inbound flows) it is empty.
         (
             uint256 sourceChainId,
             uint256 destinationChainId,
             string memory destinationAddress,
-            uint256 operationId
-        ) = abi.decode(payload, (uint256, uint256, string, uint256));
+            uint256 operationId,
+            bytes memory settlementData
+        ) = abi.decode(payload, (uint256, uint256, string, uint256, bytes));
 
         // 4. Approve Bridge to pull the USDT0 we just received via lzReceive.
         IERC20(token).safeIncreaseAllowance(bridge, amountLD);
@@ -190,21 +195,23 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
         //    Executor forwarded into this lzCompose, sized off-chain by the
         //    backend to match the route's NATIVE commission (or 0 for
         //    TOKEN-currency routes). Calls the adapter-only `fundsIn` overload
-        //    (5-arg, `onlyLZAdapter`-gated) so the non-spoofable
-        //    `sourceChainId` reaches commission routing. If Bridge rejects the
-        //    call (paused, duplicate operationId, native-value mismatch, …) the
-        //    funds are parked in `_stuckFunds[_guid]` and recoverable off the
-        //    hot path.
+        //    (6-arg, `onlyLZAdapter`-gated) so the non-spoofable
+        //    `sourceChainId` reaches commission routing and `settlementData`
+        //    reaches the route's `SettlementModule.onFundsIn`. If Bridge
+        //    rejects the call (paused, route disabled, settlement module
+        //    rejects, native-value mismatch, …) the funds are parked in
+        //    `_stuckFunds[_guid]` and recoverable off the hot path.
         try IBridge(bridge).fundsIn{ value: msg.value }(
             amountLD,
             sourceChainId,
             destinationChainId,
             destinationAddress,
-            operationId
+            operationId,
+            settlementData
         ) {
             emit ComposeFundsIn(
                 _guid, sourceChainId, amountLD,
-                destinationChainId, destinationAddress, operationId
+                destinationChainId, destinationAddress, operationId, settlementData
             );
         } catch (bytes memory reason) {
             // Bridge did not pull the approved allowance — reset it so the
@@ -217,12 +224,13 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
                 operationId:        operationId,
                 sourceChainId:      sourceChainId,
                 destinationChainId: destinationChainId,
-                destinationAddress: destinationAddress
+                destinationAddress: destinationAddress,
+                settlementData:     settlementData
             });
 
             emit ComposeFundsInFailed(
                 _guid, sourceChainId, amountLD, msg.value,
-                destinationChainId, destinationAddress, operationId, reason
+                destinationChainId, destinationAddress, operationId, settlementData, reason
             );
         }
     }
