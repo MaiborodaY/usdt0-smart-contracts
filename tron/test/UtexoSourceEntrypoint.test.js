@@ -116,14 +116,23 @@ async function deployExpectRevert(artifact, ...parameters) {
   assert.fail(`Deploy succeeded when constructor revert was expected (addr ${instance.address})`);
 }
 
+/// Default `settlementData` for LZ-adapter flows: destination route is
+/// registered with `NullSettlementModule`, so the blob is empty bytes.
+const EMPTY_SETTLEMENT_DATA = '0x';
+
 /**
  * ABI-encodes the business payload that `Entrypoint.deposit` will decode:
- *   abi.encode(uint256 destinationChainId, string destinationAddress, uint256 operationId)
+ *   abi.encode(uint256 destinationChainId, string destinationAddress,
+ *              uint256 operationId, bytes settlementData)
+ *
+ * `settlementData` defaults to `EMPTY_SETTLEMENT_DATA` — for LZ-adapter routes
+ * registered with `NullSettlementModule` on Arbitrum, the blob is always empty.
+ * Non-empty values are exercised by the round-trip test below.
  */
-function encodePayload(destChainId, destAddr, opId) {
+function encodePayload(destChainId, destAddr, opId, settlementData = EMPTY_SETTLEMENT_DATA) {
   return tronWeb.utils.abi.encodeParams(
-    ['uint256', 'string', 'uint256'],
-    [destChainId.toString(), destAddr, opId.toString()]
+    ['uint256', 'string', 'uint256', 'bytes'],
+    [destChainId.toString(), destAddr, opId.toString(), settlementData]
   );
 }
 
@@ -264,7 +273,7 @@ contract('UtexoSourceEntrypoint', () => {
       );
     });
 
-    it('builds composeMsg = abi.encode(block.chainid, destChainId, destAddr, opId)', async () => {
+    it('builds composeMsg = abi.encode(block.chainid, destChainId, destAddr, opId, settlementData)', async () => {
       await token.approve(entrypoint.address, AMOUNT_LD).send({ feeLimit: FEE_LIMIT });
 
       await entrypoint.deposit(
@@ -274,7 +283,7 @@ contract('UtexoSourceEntrypoint', () => {
       const composeMsg = await oft.lastComposeMsg().call();
       const decoded = tronWeb.utils.abi.decodeParams(
         [],
-        ['uint256', 'uint256', 'string', 'uint256'],
+        ['uint256', 'uint256', 'string', 'uint256', 'bytes'],
         composeMsg
       );
 
@@ -284,6 +293,40 @@ contract('UtexoSourceEntrypoint', () => {
       assert.equal(decoded[1].toString(), String(DEST_CHAIN_ID), 'destChainId');
       assert.equal(decoded[2],            DEST_ADDR,              'destAddr');
       assert.equal(decoded[3].toString(), String(OPERATION_ID),   'operationId');
+      assert.equal(decoded[4],            EMPTY_SETTLEMENT_DATA,  'settlementData empty by default');
+    });
+
+    /// Non-empty `settlementData` must round-trip byte-for-byte through the
+    /// payload → composeMsg pipeline so the destination route's
+    /// `SettlementModule.onFundsIn` on Arbitrum sees exactly what the caller
+    /// intended. LZ-adapter flows default to empty data
+    /// (`NullSettlementModule`), but future routes (or future modules) may
+    /// consume a non-empty blob and the entrypoint must not lose or mangle it.
+    it('round-trips non-empty settlementData through composeMsg', async () => {
+      const blob = '0xdeadbeefcafebabe1122334455667788';
+      const payloadWithBlob = encodePayload(DEST_CHAIN_ID, DEST_ADDR, OPERATION_ID, blob);
+
+      await token.approve(entrypoint.address, AMOUNT_LD).send({ feeLimit: FEE_LIMIT });
+
+      await entrypoint.deposit(
+        [AMOUNT_LD, AMOUNT_LD, '0x0003', payloadWithBlob]
+      ).send({ callValue: NATIVE_FEE, feeLimit: FEE_LIMIT });
+
+      const composeMsg = await oft.lastComposeMsg().call();
+      const decoded = tronWeb.utils.abi.decodeParams(
+        [],
+        ['uint256', 'uint256', 'string', 'uint256', 'bytes'],
+        composeMsg
+      );
+
+      assert.equal(decoded[1].toString(), String(DEST_CHAIN_ID), 'destChainId');
+      assert.equal(decoded[2],            DEST_ADDR,              'destAddr');
+      assert.equal(decoded[3].toString(), String(OPERATION_ID),   'operationId');
+      assert.equal(
+        decoded[4].toLowerCase(),
+        blob.toLowerCase(),
+        'settlementData round-trips byte-for-byte'
+      );
     });
 
     it('forwards extraOptions byte-for-byte', async () => {
