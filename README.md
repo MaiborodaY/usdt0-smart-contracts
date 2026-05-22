@@ -2,14 +2,14 @@
 
 Smart contracts for the USDT0/LayerZero integration layer of the Utexo bridge. This repository covers the **source-chain side** of cross-chain deposits: user-facing entrypoints that accept USDT (or USDT0) on chains such as Ethereum, OP, and Base, and forward them to Arbitrum via the USDT0 OFT and LayerZero V2.
 
-The Arbitrum hub contracts (Bridge, CommissionManager, MultisigProxy, BtcRelay) live in a separate repository, included here as a git submodule at `lib/utexo-smart-contracts`.
+The Arbitrum hub contracts (`Bridge`, `RouteRegistry`, per-route `FinalityVerifier` + `SettlementModule` plugins, `MultisigProxy`, `BtcRelay`) live in a separate repository, included here as a git submodule at `lib/bridge-smart-contracts`.
 
 ## Repository structure
 
 ```
 ethereum/   — EVM contracts (Solidity, Foundry)
 lib/
-  utexo-smart-contracts/   — core bridge repo (git submodule)
+  bridge-smart-contracts/   — core bridge repo (git submodule)
 ```
 
 ## Architecture
@@ -37,10 +37,14 @@ lib/
 
 ### Flow
 
-1. The user calls `UtexoSourceEntrypoint.deposit()` on the source chain, paying the LayerZero native fee. The caller supplies a `bytes payload` shaped as `abi.encode(string destinationChain, string destinationAddress, uint256 operationId)`.
-2. The entrypoint decodes `payload` on the source chain (a malformed blob reverts here, before any LZ fee is paid), then re-encodes the actual `composeMsg` as `abi.encode(block.chainid, destinationChain, destinationAddress, operationId)` and forwards the tokens into the USDT0 OFT via `OFT.send()`. The `sourceChainId` half is captured from `block.chainid` and is therefore non-spoofable by the caller.
-3. LayerZero delivers the tokens to Arbitrum and triggers `UtexoLZAdapter.lzCompose()`.
-4. `UtexoLZAdapter` calls the adapter-only overload of `Bridge.fundsIn()` on Arbitrum, threading `sourceChainId` through for commission routing and locking the funds. If `Bridge.fundsIn` reverts (paused, duplicate `operationId`, native-value mismatch, …) the inbound payload is parked on the adapter and recoverable via federation governance — see [Stuck funds](#stuck-funds).
+1. The user calls `UtexoSourceEntrypoint.deposit()` on the source chain, paying the LayerZero native fee. The caller supplies a `bytes payload` shaped as `abi.encode(uint256 destinationChainId, string destinationAddress, uint256 operationId, bytes settlementData)`.
+2. The entrypoint decodes `payload` on the source chain (a malformed blob reverts here, before any LZ fee is paid), then re-encodes the actual `composeMsg` as `abi.encode(block.chainid, destinationChainId, destinationAddress, operationId, settlementData)` and forwards the tokens into the USDT0 OFT via `OFT.send()`. The `sourceChainId` half is captured from `block.chainid` and is therefore non-spoofable by the caller.
+3. LayerZero delivers the tokens to Arbitrum and triggers `UtexoLZAdapter.lzCompose()`. The adapter checks that `composeFrom` (the source-chain `UtexoSourceEntrypoint` address, packed into the OFT message header by LayerZero itself) is in its `trustedEntrypoints` allowlist; an unknown source reverts before any Bridge interaction.
+4. `UtexoLZAdapter` calls the adapter-only overload of `Bridge.fundsIn()` on Arbitrum (6-arg: `amount, sourceChainId, destinationChainId, destinationAddress, operationId, settlementData`), threading `sourceChainId` through for commission routing and `settlementData` through to the destination route's `ISettlementModule.onFundsIn`. If `Bridge.fundsIn` reverts (paused, route disabled, duplicate `operationId`, settlement module rejects, native-value mismatch, …) the inbound payload is parked on the adapter and recoverable via federation governance — see [Stuck funds](#stuck-funds).
+
+### `settlementData`
+
+An opaque blob plumbed end-to-end (`deposit` payload → `composeMsg` → `Bridge.fundsIn` → destination route's `SettlementModule`). The source-chain pipeline is route-agnostic: neither `UtexoSourceEntrypoint` nor `UtexoLZAdapter` inspects the bytes — the destination route's `SettlementModule` does. For LZ-adapter inbound routes currently registered with `NullSettlementModule` on the Bridge (e.g. EVM-source → Arbitrum → RGB), callers pass `""`. Routes whose module consumes settlement data start populating the blob once they go live; no contract change is required.
 
 ## Contracts
 
@@ -66,8 +70,14 @@ Deployed once on Arbitrum. Non-upgradeable — all five participating addresses 
 
 Two flows:
 
-- **Inbound (`lzCompose`)** — invoked by the LayerZero endpoint when a USDT0 OFT message addressed to the adapter arrives on Arbitrum. The adapter approves the `Bridge` and forwards the deposit into `Bridge.fundsIn`. The call is wrapped in `try/catch`: on revert the funds are stored on the adapter and a `ComposeFundsInFailed` event is emitted (see [Stuck funds](#stuck-funds)). The adapter's outer call always returns successfully so the LayerZero endpoint clears its compose queue.
+- **Inbound (`lzCompose`)** — invoked by the LayerZero endpoint when a USDT0 OFT message addressed to the adapter arrives on Arbitrum. The adapter first validates `composeFrom` against `trustedEntrypoints` (unknown sources revert `UntrustedComposeSource` before any token movement), then approves the `Bridge` and forwards the deposit into the 6-arg `Bridge.fundsIn`. The call is wrapped in `try/catch`: on revert the funds are stored on the adapter and a `ComposeFundsInFailed` event is emitted (see [Stuck funds](#stuck-funds)). The adapter's outer call always returns successfully so the LayerZero endpoint clears its compose queue.
 - **Outbound (`sendOut`)** — restricted to `MultisigProxy`. Called from a TEE-signed `executeBatch` immediately after `Bridge.fundsOut(recipient = adapter)`. Re-quotes the LayerZero fee on-chain; any surplus `msg.value` is refunded to `tx.origin` (the backend relayer EOA that submitted the batch — `MultisigProxy` has no `receive()` and would reject a refund).
+
+#### Trusted entrypoints
+
+`UtexoLZAdapter` keeps a per-source-chain allowlist of `UtexoSourceEntrypoint` addresses (`mapping(bytes32 => bool) trustedEntrypoints`) and rejects any inbound `lzCompose` whose `composeFrom` is not in it. LayerZero itself packs the source-side OApp address into the OFT message header, so this gate is independent of `payload` contents — it stops a malicious OFT-compatible contract on any source chain from impersonating an entrypoint.
+
+The allowlist is mutated by `setTrustedEntrypoint(bytes32 entrypoint, bool trusted)`, gated on `MultisigProxy`. Until at least one entrypoint is trusted after deployment, every inbound `lzCompose` reverts and the LZ compose queue stalls — see the [Post-deployment checklist](#post-deployment-checklist).
 
 #### Stuck funds
 
@@ -78,7 +88,8 @@ When `Bridge.fundsIn` reverts inside `lzCompose`, the parked payload is recorded
 | `amountLD` | USDT0 minted onto the adapter by the OFT |
 | `nativeValue` | Native (wei) the LayerZero Executor forwarded into `lzCompose` (non-zero for NATIVE-currency commission routes, 0 for TOKEN routes) |
 | `sourceChainId` | EVM `block.chainid` of the source chain, captured by `UtexoSourceEntrypoint` at deposit time |
-| `operationId`, `destinationChain`, `destinationAddress` | Business fields copied from the decoded `composeMsg` for off-chain diagnostics |
+| `operationId`, `destinationChainId`, `destinationAddress` | Business fields copied from the decoded `composeMsg` for off-chain diagnostics |
+| `settlementData` | Opaque blob from the original `composeMsg`, captured for off-chain debugging only — `refundStuckFunds` does not consume it (refunds are not retried as `fundsIn`) |
 
 Read a record via `getStuckFunds(guid) returns (StuckFunds memory)`. `amountLD == 0` means "no record".
 
@@ -126,26 +137,54 @@ forge clean                                                           # delete o
 
 ## Deployment
 
-Copy `.env.example` to `.env` and fill in the values:
+Two scripts, one per contract. Both read `RPC_URL` + `PRIVATE_KEY` from the environment — point them at the chain you are deploying to (source chain for the entrypoint, Arbitrum for the adapter).
+
+Copy `.env.example` to `.env` and fill in the values for whichever script you are about to run.
+
+### `UtexoSourceEntrypoint` (source chain)
 
 | Variable | Description |
 |---|---|
-| `RPC_URL` | RPC endpoint of the source chain |
-| `PRIVATE_KEY` | Deployer private key |
-| `TOKEN_ADDRESS` | ERC-20 to pull from users |
-| `OFT_ADDRESS` | USDT0 OFT on this source chain |
-| `DST_EID` | LayerZero endpoint id of destination (Arbitrum = 30110) |
-| `LZ_ADAPTER` | `UtexoLZAdapter` address on destination, left-padded to `bytes32` |
+| `TOKEN_ADDRESS` | ERC-20 pulled from users (canonical USDT on Ethereum; USDT0 on chains where it is native) |
+| `OFT_ADDRESS` | USDT0 OFT (adapter or native) on this source chain |
+| `DST_EID` | LayerZero endpoint id of the destination chain (Arbitrum One = 30110) |
+| `LZ_ADAPTER` | `UtexoLZAdapter` address on the destination chain, left-padded to `bytes32` |
 
 ```sh
 forge script script/deploy/DeployUtexoSourceEntrypoint.s.sol \
   --rpc-url $RPC_URL --broadcast --verify
 ```
 
-The contract is stateless — no ownership transfer is needed after deployment.
+The entrypoint is stateless — no ownership transfer is needed after deployment.
+
+### `UtexoLZAdapter` (Arbitrum)
+
+| Variable | Description |
+|---|---|
+| `LZ_ENDPOINT_ADDRESS` | LayerZero V2 EndpointV2 on Arbitrum |
+| `OFT_ADDRESS` | USDT0 OFT on Arbitrum |
+| `TOKEN_ADDRESS` | USDT0 token on Arbitrum |
+| `BRIDGE_ADDRESS` | Utexo `Bridge` on Arbitrum |
+| `MULTISIG_PROXY_ADDRESS` | Utexo `MultisigProxy` on Arbitrum |
+
+```sh
+forge script script/deploy/DeployUtexoLZAdapter.s.sol \
+  --rpc-url $RPC_URL --broadcast --verify
+```
+
+The adapter has no owner. Mutable state (`trustedEntrypoints`, stuck-funds map) is gated on `MultisigProxy`.
 
 ## Post-deployment checklist
+
+### `UtexoSourceEntrypoint`
 
 1. Verify immutables: `token`, `oft`, `dstEid`, `lzAdapter` match expected values.
 2. Call `quote(params)` to confirm the OFT is reachable and returns a non-zero fee.
 3. Do a test `deposit()` with a small amount on testnet to confirm token flow and event emission.
+
+### `UtexoLZAdapter`
+
+1. Verify immutables: `endpoint`, `oft`, `token`, `bridge`, `multisigProxy` match expected values.
+2. From `MultisigProxy`, set `lzAdapter` on `Bridge` to the new adapter address (via the bridge-smart-contracts admin scripts). Until that rotation lands, the adapter-only `Bridge.fundsIn` overload reverts `NotLZAdapter` and inbound deposits get stuck.
+3. From `MultisigProxy`, whitelist each source-chain `UtexoSourceEntrypoint` via `setTrustedEntrypoint(bytes32 entrypoint, true)`. The argument is the entrypoint address left-padded to 32 bytes — same shape as `LZ_ADAPTER` on the source side. **Until at least one entrypoint is trusted, every inbound `lzCompose` reverts `UntrustedComposeSource` and the LZ compose queue stalls.**
+4. End-to-end smoke test: deposit a small amount on testnet from one of the whitelisted entrypoints and verify the `ComposeFundsIn` event fires on the adapter and `Bridge.fundsIn` lands the funds.

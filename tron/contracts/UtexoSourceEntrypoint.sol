@@ -11,7 +11,7 @@ import { MessagingFee, MessagingReceipt } from '@layerzerolabs/lz-evm-protocol-v
 import { IUtexoSourceEntrypoint } from './interfaces/IUtexoSourceEntrypoint.sol';
 
 /// @title UtexoSourceEntrypoint
-/// @notice Utexo's user-facing deposit contract on source chains (Ethereum, OP, Base, …).
+/// @notice Utexo's user-facing deposit contract on source chains (Ethereum, OP, Tron, …).
 /// @dev
 ///     ┌────────────┐ transferFrom  ┌────────────────────┐   OFT.send    ┌──────────────┐
 ///     │  user EOA  │──────────────▶│ UtexoSource        │──────────────▶│ USDT0 OFT    │
@@ -66,8 +66,8 @@ contract UtexoSourceEntrypoint is IUtexoSourceEntrypoint, ReentrancyGuard {
     // Constructor
     // =========================================================================
 
-    /// @param token_      ERC-20 that will be pulled from users and forwarded into
-    ///                    the OFT. On Ethereum this is canonical USDT; on chains
+    /// @param token_      TRC-20 that will be pulled from users and forwarded into
+    ///                    the OFT. On Tron this is canonical USDT; on chains
     ///                    where USDT0 is native this is the USDT0 token itself.
     /// @param oft_        USDT0 OFT on this chain.
     /// @param dstEid_     LayerZero endpoint id of the destination chain (Arbitrum).
