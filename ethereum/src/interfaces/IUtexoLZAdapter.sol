@@ -31,6 +31,9 @@ interface IUtexoLZAdapter {
     ///                            namespace ids above the EVM range for non-EVM
     ///                            endpoints (e.g. RGB = 1_000_001).
     /// @param destinationAddress  Final recipient on the destination chain.
+    /// @param settlementData      Opaque blob plumbed through to the
+    ///                            destination route's `SettlementModule.onFundsIn`
+    ///                            on the Bridge.
     struct StuckFunds {
         uint256 amountLD;
         uint256 nativeValue;
@@ -38,6 +41,7 @@ interface IUtexoLZAdapter {
         uint256 sourceChainId;
         uint256 destinationChainId;
         string  destinationAddress;
+        bytes   settlementData;
     }
 
     // =========================================================================
@@ -76,13 +80,18 @@ interface IUtexoLZAdapter {
     ///                            non-EVM destinations).
     /// @param destinationAddress  Target address on the destination chain.
     /// @param operationId         Backend-assigned operation identifier.
+    /// @param settlementData      Opaque blob forwarded to the destination
+    ///                            route's `SettlementModule.onFundsIn` on the
+    ///                            Bridge. Empty for routes registered with
+    ///                            `NullSettlementModule`.
     event ComposeFundsIn(
         bytes32 indexed guid,
         uint256 sourceChainId,
         uint256 amountLD,
         uint256 destinationChainId,
         string  destinationAddress,
-        uint256 operationId
+        uint256 operationId,
+        bytes   settlementData
     );
 
     /// @notice Emitted on a successful outbound `sendOut` → `OFT.send` call.
@@ -110,6 +119,7 @@ interface IUtexoLZAdapter {
         uint256 destinationChainId,
         string  destinationAddress,
         uint256 operationId,
+        bytes   settlementData,
         bytes   reason
     );
 

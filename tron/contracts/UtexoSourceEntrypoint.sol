@@ -30,14 +30,17 @@ import { IUtexoSourceEntrypoint } from './interfaces/IUtexoSourceEntrypoint.sol'
 ///       • `dstEid` and `lzAdapter` are fixed at construction and cannot be
 ///         re-pointed at a different destination by the caller or anyone else.
 ///       • `composeMsg` is built by the entrypoint as
-///         `abi.encode(block.chainid, destinationChainId, destinationAddress, operationId)`,
-///         where the destination fields are extracted from the caller-supplied
-///         `payload` blob via `abi.decode`. All chain identifiers are `uint256`
-///         (real `block.chainid` for EVM endpoints, backend-assigned ids above
-///         the EVM range for non-EVM endpoints such as RGB = 1_000_001).
-///         A malformed `payload` reverts here on the source chain so no LZ fee is
-///         ever paid for an un-decodable compose, and the `sourceChainId` part
-///         is non-spoofable.
+///         `abi.encode(block.chainid, destinationChainId, destinationAddress, operationId, settlementData)`,
+///         where the destination fields and `settlementData` are extracted from
+///         the caller-supplied `payload` blob via `abi.decode`. All chain
+///         identifiers are `uint256` (real `block.chainid` for EVM endpoints,
+///         backend-assigned ids above the EVM range). `settlementData` is an opaque blob whose layout
+///         is dictated by the destination route's `SettlementModule` on
+///         Arbitrum — the entrypoint plumbs it through unchanged. For routes
+///         registered with `NullSettlementModule` (the default for LZ-adapter
+///         flows) it is empty (`""`). A malformed `payload` reverts here on the
+///         source chain so no LZ fee is ever paid for an un-decodable compose,
+///         and the `sourceChainId` part is non-spoofable.
 ///       • LayerZero fee is re-quoted on-chain; surplus `msg.value` is refunded to
 ///         `msg.sender`.
 contract UtexoSourceEntrypoint is IUtexoSourceEntrypoint, ReentrancyGuard {
@@ -115,14 +118,16 @@ contract UtexoSourceEntrypoint is IUtexoSourceEntrypoint, ReentrancyGuard {
         (
             uint256 destinationChainId,
             string memory destinationAddress,
-            uint256 operationId
-        ) = abi.decode(depositParams.payload, (uint256, string, uint256));
+            uint256 operationId,
+            bytes memory settlementData
+        ) = abi.decode(depositParams.payload, (uint256, string, uint256, bytes));
 
         bytes memory composeMsg = abi.encode(
             block.chainid,
             destinationChainId,
             destinationAddress,
-            operationId
+            operationId,
+            settlementData
         );
 
         // 3. Build the LayerZero send parameters. `dstEid` and `to` are immutable
@@ -166,7 +171,8 @@ contract UtexoSourceEntrypoint is IUtexoSourceEntrypoint, ReentrancyGuard {
             block.chainid,
             destinationChainId,
             destinationAddress,
-            operationId
+            operationId,
+            settlementData
         );
     }
 
@@ -182,14 +188,16 @@ contract UtexoSourceEntrypoint is IUtexoSourceEntrypoint, ReentrancyGuard {
         (
             uint256 destinationChainId,
             string memory destinationAddress,
-            uint256 operationId
-        ) = abi.decode(depositParams.payload, (uint256, string, uint256));
+            uint256 operationId,
+            bytes memory settlementData
+        ) = abi.decode(depositParams.payload, (uint256, string, uint256, bytes));
 
         bytes memory composeMsg = abi.encode(
             block.chainid,
             destinationChainId,
             destinationAddress,
-            operationId
+            operationId,
+            settlementData
         );
         SendParam memory sp = SendParam({
             dstEid:       dstEid,
