@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.35;
 
 /// @title IUtexoLZAdapter
 /// @notice Bidirectional adapter between the Utexo `Bridge` and the LayerZero / USDT0 stack
