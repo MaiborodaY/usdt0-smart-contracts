@@ -893,6 +893,108 @@ contract UtexoLZAdapterTest is Test {
 
         assertEq(token.balanceOf(address(bridge)), amount,          'bridge received tokens');
         assertEq(bridge.lastSourceChainId(),       SOURCE_CHAIN_ID, 'sourceChainId forwarded');
+    // lzCompose — credited amount accounting
+    // =========================================================================
+
+    /// @dev The adapter must forward the OFT-credited `amountLD` from the compose
+    ///      envelope. It must not infer the amount from adapter balance or payload data.
+    function test_lzCompose_usesCreditedAmountNotSourceRequestedAmount() public {
+        uint256 sourceRequestedAmount = 10e6;
+        uint256 creditedAmount        = 7e6;
+        token.mint(address(adapter), sourceRequestedAmount);
+
+        uint256 destChainId = RGB_CHAIN_ID;
+        string  memory destAddr = 'tb1q-credited';
+        uint256 opId            = 777;
+
+        bytes memory message = _encodeCompose(
+            uint64(1), SRC_EID, creditedAmount, TRUSTED_ENTRYPOINT_B32,
+            abi.encode(SOURCE_CHAIN_ID, destChainId, destAddr, opId, EMPTY_SETTLEMENT_DATA)
+        );
+
+        bytes32 guid = bytes32('credited-guid');
+
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit ComposeFundsIn(
+            guid,
+            SOURCE_CHAIN_ID,
+            creditedAmount,
+            destChainId,
+            destAddr,
+            opId,
+            EMPTY_SETTLEMENT_DATA
+        );
+
+        vm.prank(endpoint);
+        adapter.lzCompose(address(oft), guid, message, address(0), '');
+
+        assertEq(bridge.lastAmount(), creditedAmount, 'credited amount forwarded');
+        assertEq(token.balanceOf(address(bridge)), creditedAmount, 'bridge receives credited amount');
+        assertEq(
+            token.balanceOf(address(adapter)),
+            sourceRequestedAmount - creditedAmount,
+            'adapter retains excess balance'
+        );
+        assertEq(token.allowance(address(adapter), address(bridge)), 0, 'allowance consumed');
+    }
+
+    // =========================================================================
+    // lzCompose — Bridge revert reason regression
+    // =========================================================================
+
+    /// @dev The raw Bridge revert returndata is operationally important: indexers
+    ///      and recovery tooling use it to classify why funds were parked.
+    function test_lzCompose_bridgeRevertReasonPreserved() public {
+        bridge.setReverts(true);
+
+        uint256 amount      = 3e6;
+        uint256 nativeValue = 0.007 ether;
+        token.mint(address(adapter), amount);
+
+        bytes32 guid        = bytes32('reason-guid');
+        uint256 destChainId = RGB_CHAIN_ID;
+        string  memory destAddr = 'tb1q-reason';
+        uint256 opId            = 12345;
+        bytes   memory settlementData = hex'feedbeef';
+        bytes   memory expectedReason =
+            abi.encodeWithSignature('Error(string)', 'MockBridge: forced revert');
+
+        bytes memory message = _encodeCompose(
+            uint64(1), SRC_EID, amount, TRUSTED_ENTRYPOINT_B32,
+            abi.encode(SOURCE_CHAIN_ID, destChainId, destAddr, opId, settlementData)
+        );
+
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit ComposeFundsInFailed(
+            guid,
+            SOURCE_CHAIN_ID,
+            amount,
+            nativeValue,
+            destChainId,
+            destAddr,
+            opId,
+            settlementData,
+            expectedReason
+        );
+
+        vm.prank(endpoint);
+        adapter.lzCompose{ value: nativeValue }(
+            address(oft), guid, message, address(0), ''
+        );
+
+        assertEq(token.balanceOf(address(bridge)),  0,      'bridge unchanged');
+        assertEq(token.balanceOf(address(adapter)), amount, 'adapter still holds tokens');
+        assertEq(address(adapter).balance,          nativeValue, 'adapter holds native');
+        assertEq(token.allowance(address(adapter), address(bridge)), 0, 'allowance reset');
+
+        IUtexoLZAdapter.StuckFunds memory rec = adapter.getStuckFunds(guid);
+        assertEq(rec.amountLD,           amount,          'stuck amountLD');
+        assertEq(rec.nativeValue,        nativeValue,     'stuck nativeValue');
+        assertEq(rec.operationId,        opId,            'stuck opId');
+        assertEq(rec.sourceChainId,      SOURCE_CHAIN_ID, 'stuck sourceChainId');
+        assertEq(rec.destinationChainId, destChainId,     'stuck destChainId');
+        assertEq(rec.destinationAddress, destAddr,        'stuck destAddr');
+        assertEq(rec.settlementData,     settlementData,  'stuck settlementData');
     }
 
     // =========================================================================
