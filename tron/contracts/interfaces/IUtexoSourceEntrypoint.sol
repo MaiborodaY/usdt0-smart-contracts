@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.26;
 
 /// @title IUtexoSourceEntrypoint
 /// @notice User-facing deposit entrypoint on source chains (Ethereum, OP, Base, …).

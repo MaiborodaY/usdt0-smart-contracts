@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.35;
 
 import { Test } from 'forge-std/Test.sol';
 
@@ -54,7 +54,7 @@ contract UtexoLZAdapterTest is Test {
         uint256 nativeValue
     );
 
-    event TrustedEntrypointSet(bytes32 indexed entrypoint, bool trusted);
+    event TrustedEntrypointSet(uint32 indexed srcEid, bytes32 entrypoint, uint256 chainId);
 
     // -- Constants ------------------------------------------------------------
     uint32  constant SRC_EID         = 30101;     // LZ endpoint id of the inbound packet
@@ -102,9 +102,10 @@ contract UtexoLZAdapterTest is Test {
         vm.deal(endpoint,      100 ether);
         vm.deal(multisigProxy, 100 ether);
 
-        // Whitelist the entrypoint used by every "honest" inbound test.
+        // Register the trusted source used by every "honest" inbound test:
+        // transport SRC_EID -> entrypoint, bound to business chain id SOURCE_CHAIN_ID.
         vm.prank(multisigProxy);
-        adapter.setTrustedEntrypoint(TRUSTED_ENTRYPOINT_B32, true);
+        adapter.setTrustedEntrypoint(SRC_EID, TRUSTED_ENTRYPOINT_B32, SOURCE_CHAIN_ID);
     }
 
     // =========================================================================
@@ -217,11 +218,17 @@ contract UtexoLZAdapterTest is Test {
     /// @dev `sourceChainId` is read from the business payload (set by
     ///      `UtexoSourceEntrypoint` from `block.chainid` on the source side)
     ///      and surfaced both via the event and via the forwarded
-    ///      `Bridge.fundsIn` call.
+    ///      `Bridge.fundsIn` call. Post R-M-02 the value must also match the
+    ///      chain id registered for the transport `srcEid`, so this test binds
+    ///      SRC_EID to the custom chain id before composing.
     function test_lzCompose_emitsSourceChainIdFromPayload() public {
         uint256 customChainId = 137; // pretend the deposit came from Polygon
         uint256 amount        = 7e6;
         token.mint(address(adapter), amount);
+
+        // Bind SRC_EID -> customChainId so the declared sourceChainId is accepted.
+        vm.prank(multisigProxy);
+        adapter.setTrustedEntrypoint(SRC_EID, TRUSTED_ENTRYPOINT_B32, customChainId);
 
         bytes memory message = _encodeCompose(
             uint64(99),
@@ -710,26 +717,31 @@ contract UtexoLZAdapterTest is Test {
     // =========================================================================
 
     function test_setTrustedEntrypoint_setsAndUnsets() public {
-        bytes32 ep = bytes32(uint256(0xC0FFEE));
+        uint32  eid   = 40161;                    // some other transport eid
+        bytes32 ep    = bytes32(uint256(0xC0FFEE));
+        uint256 chain = 8453;                      // Base
 
-        // Initial state: not trusted.
-        assertEq(adapter.trustedEntrypoints(ep), false, 'starts untrusted');
+        // Initial state: nothing registered for this eid.
+        assertEq(adapter.trustedEntrypoints(eid), bytes32(0), 'starts unregistered');
+        assertEq(adapter.eidToChainId(eid),       0,          'starts unmapped');
 
-        // Set true.
+        // Register: srcEid -> (entrypoint, chainId).
         vm.expectEmit(true, false, false, true, address(adapter));
-        emit TrustedEntrypointSet(ep, true);
+        emit TrustedEntrypointSet(eid, ep, chain);
 
         vm.prank(multisigProxy);
-        adapter.setTrustedEntrypoint(ep, true);
-        assertEq(adapter.trustedEntrypoints(ep), true, 'trusted after set(true)');
+        adapter.setTrustedEntrypoint(eid, ep, chain);
+        assertEq(adapter.trustedEntrypoints(eid), ep,    'entrypoint set');
+        assertEq(adapter.eidToChainId(eid),       chain, 'chainId set');
 
-        // Set false.
+        // Revoke: entrypoint == 0 clears both halves of the binding.
         vm.expectEmit(true, false, false, true, address(adapter));
-        emit TrustedEntrypointSet(ep, false);
+        emit TrustedEntrypointSet(eid, bytes32(0), 0);
 
         vm.prank(multisigProxy);
-        adapter.setTrustedEntrypoint(ep, false);
-        assertEq(adapter.trustedEntrypoints(ep), false, 'untrusted after set(false)');
+        adapter.setTrustedEntrypoint(eid, bytes32(0), 0);
+        assertEq(adapter.trustedEntrypoints(eid), bytes32(0), 'entrypoint cleared');
+        assertEq(adapter.eidToChainId(eid),       0,          'chainId cleared');
     }
 
     function test_setTrustedEntrypoint_revertsIfNotMultisigProxy() public {
@@ -738,13 +750,19 @@ contract UtexoLZAdapterTest is Test {
 
         vm.prank(attacker);
         vm.expectRevert(IUtexoLZAdapter.NotMultisigProxy.selector);
-        adapter.setTrustedEntrypoint(ep, true);
+        adapter.setTrustedEntrypoint(SRC_EID, ep, SOURCE_CHAIN_ID);
     }
 
-    function test_setTrustedEntrypoint_revertsOnZeroEntrypoint() public {
+    function test_setTrustedEntrypoint_revertsOnZeroSrcEid() public {
         vm.prank(multisigProxy);
-        vm.expectRevert(IUtexoLZAdapter.InvalidEntrypoint.selector);
-        adapter.setTrustedEntrypoint(bytes32(0), true);
+        vm.expectRevert(IUtexoLZAdapter.InvalidSrcEid.selector);
+        adapter.setTrustedEntrypoint(0, TRUSTED_ENTRYPOINT_B32, SOURCE_CHAIN_ID);
+    }
+
+    function test_setTrustedEntrypoint_revertsOnZeroChainIdWhenRegistering() public {
+        vm.prank(multisigProxy);
+        vm.expectRevert(IUtexoLZAdapter.InvalidChainId.selector);
+        adapter.setTrustedEntrypoint(SRC_EID, TRUSTED_ENTRYPOINT_B32, 0);
     }
 
     // =========================================================================
@@ -765,7 +783,7 @@ contract UtexoLZAdapterTest is Test {
 
         vm.prank(endpoint);
         vm.expectRevert(abi.encodeWithSelector(
-            IUtexoLZAdapter.UntrustedComposeSource.selector, attackerB32
+            IUtexoLZAdapter.UntrustedComposeSource.selector, SRC_EID, attackerB32
         ));
         adapter.lzCompose(address(oft), bytes32('x'), message, address(0), '');
 
@@ -779,9 +797,9 @@ contract UtexoLZAdapterTest is Test {
     }
 
     function test_lzCompose_revertsWhenTrustedEntrypointRevoked() public {
-        // Revoke the entrypoint that `setUp` whitelisted.
+        // Revoke the binding that `setUp` registered for SRC_EID.
         vm.prank(multisigProxy);
-        adapter.setTrustedEntrypoint(TRUSTED_ENTRYPOINT_B32, false);
+        adapter.setTrustedEntrypoint(SRC_EID, bytes32(0), 0);
 
         bytes memory message = _encodeCompose(
             uint64(1), SRC_EID, 1e6, TRUSTED_ENTRYPOINT_B32,
@@ -790,12 +808,91 @@ contract UtexoLZAdapterTest is Test {
 
         vm.prank(endpoint);
         vm.expectRevert(abi.encodeWithSelector(
-            IUtexoLZAdapter.UntrustedComposeSource.selector, TRUSTED_ENTRYPOINT_B32
+            IUtexoLZAdapter.UntrustedComposeSource.selector, SRC_EID, TRUSTED_ENTRYPOINT_B32
         ));
         adapter.lzCompose(address(oft), bytes32('y'), message, address(0), '');
     }
 
     // =========================================================================
+    // R-M-02 regression — srcEid binding (post-fix)
+    // =========================================================================
+
+    /// @dev UT-FIX-04. After the fix, a packet whose payload `sourceChainId`
+    ///      does not match the chain id registered for its transport `srcEid`
+    ///      must be rejected — even when the caller IS the entrypoint trusted
+    ///      for that srcEid. Proves `sourceChainId` (which drives route +
+    ///      commission selection) is corroborated by the LayerZero transport
+    ///      rather than taken on faith from the payload.
+    function test_srcEidMustMatchDeclaredSourceChain_afterFix() public {
+        uint256 amount = 1e6;
+        token.mint(address(adapter), amount);
+
+        // setUp registered SRC_EID -> (TRUSTED_ENTRYPOINT_B32, SOURCE_CHAIN_ID).
+        // Keep the trusted entrypoint, but declare a different sourceChainId.
+        uint256 wrongChainId = SOURCE_CHAIN_ID + 999;
+
+        bytes memory message = _encodeCompose(
+            uint64(1), SRC_EID, amount, TRUSTED_ENTRYPOINT_B32,
+            abi.encode(wrongChainId, RGB_CHAIN_ID, string('addr'), uint256(7), EMPTY_SETTLEMENT_DATA)
+        );
+
+        vm.prank(endpoint);
+        vm.expectRevert(abi.encodeWithSelector(
+            IUtexoLZAdapter.SourceChainIdMismatch.selector, SRC_EID, wrongChainId
+        ));
+        adapter.lzCompose(address(oft), bytes32('mismatch'), message, address(0), '');
+
+        // The call reverts wholesale: no tokens moved, no stuck record created.
+        assertEq(token.balanceOf(address(bridge)),  0,      'bridge untouched');
+        assertEq(token.balanceOf(address(adapter)), amount, 'adapter still holds tokens');
+        assertEq(adapter.getStuckFunds(bytes32('mismatch')).amountLD, 0, 'no stuck record');
+    }
+
+    /// @dev An entrypoint trusted for one `srcEid` must NOT be honoured on a
+    ///      different `srcEid` (here unregistered). Proves trust is bound to the
+    ///      transport origin LayerZero attests, not to the bare caller address
+    ///      — so a trusted entrypoint cannot have its messages accepted as if
+    ///      they arrived from another source chain.
+    function test_lzCompose_revertsWhenEntrypointTrustedForDifferentSrcEid_afterFix() public {
+        uint32  otherEid = 40161; // not registered in setUp
+        uint256 amount   = 1e6;
+        token.mint(address(adapter), amount);
+
+        // composeFrom is the entrypoint trusted for SRC_EID, but the transport
+        // srcEid here is `otherEid`, for which nothing is registered.
+        bytes memory message = _encodeCompose(
+            uint64(1), otherEid, amount, TRUSTED_ENTRYPOINT_B32,
+            abi.encode(SOURCE_CHAIN_ID, RGB_CHAIN_ID, string('addr'), uint256(7), EMPTY_SETTLEMENT_DATA)
+        );
+
+        vm.prank(endpoint);
+        vm.expectRevert(abi.encodeWithSelector(
+            IUtexoLZAdapter.UntrustedComposeSource.selector, otherEid, TRUSTED_ENTRYPOINT_B32
+        ));
+        adapter.lzCompose(address(oft), bytes32('wrong-eid'), message, address(0), '');
+
+        assertEq(token.balanceOf(address(bridge)),  0,      'bridge untouched');
+        assertEq(token.balanceOf(address(adapter)), amount, 'adapter still holds tokens');
+    }
+
+    /// @dev Happy path with all three bindings aligned: trusted entrypoint for
+    ///      the transport `srcEid` AND a payload `sourceChainId` that matches the
+    ///      chain id registered for that srcEid. The call must succeed and
+    ///      forward to the Bridge.
+    function test_lzCompose_succeedsWhenSrcEidEntrypointAndChainIdAllMatch_afterFix() public {
+        uint256 amount = 1e6;
+        token.mint(address(adapter), amount);
+
+        bytes memory message = _encodeCompose(
+            uint64(1), SRC_EID, amount, TRUSTED_ENTRYPOINT_B32,
+            abi.encode(SOURCE_CHAIN_ID, RGB_CHAIN_ID, string('addr'), uint256(7), EMPTY_SETTLEMENT_DATA)
+        );
+
+        vm.prank(endpoint);
+        adapter.lzCompose(address(oft), bytes32('ok'), message, address(0), '');
+
+        assertEq(token.balanceOf(address(bridge)), amount,          'bridge received tokens');
+        assertEq(bridge.lastSourceChainId(),       SOURCE_CHAIN_ID, 'sourceChainId forwarded');
     // lzCompose — credited amount accounting
     // =========================================================================
 

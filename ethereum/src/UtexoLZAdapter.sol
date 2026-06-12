@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.35;
 
 import { IERC20 }    from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import { SafeERC20 } from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
@@ -29,8 +29,9 @@ import { IBridge }         from '@bridge-smart-contracts/interfaces/IBridge.sol'
 ///      │  LayerZero ──► UtexoLZAdapter.lzCompose                                  │
 ///      │                  │                                                       │
 ///      │                  ├─► validate msg.sender == endpoint, _from == oft       │
-///      │                  ├─► validate composeFrom ∈ trustedEntrypoints           │
+///      │                  ├─► validate composeFrom == trustedEntrypoints[srcEid]  │
 ///      │                  ├─► decode amountLD + business payload                  │
+///      │                  ├─► validate eidToChainId[srcEid] == sourceChainId      │
 ///      │                  ├─► approve Bridge for amountLD                         │
 ///      │                  ├─► try Bridge.fundsIn{value: msg.value}                │
 ///      │                  │     • on success: emit ComposeFundsIn                 │
@@ -79,14 +80,35 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
     // Storage
     // =========================================================================
 
-    /// @notice Trusted source-chain entrypoint set. `lzCompose` accepts a
-    ///         call only if `OFTComposeMsgCodec.composeFrom(_message)` is
-    ///         flagged here. Maintained by federation governance via
-    ///         `setTrustedEntrypoint` (callable only by `multisigProxy`).
+    /// @notice Trusted source registry, keyed by the LayerZero transport source
+    ///         id (`srcEid`) rather than by raw caller address. For each `srcEid`
+    ///         it stores the single entrypoint allowed to drive `lzCompose` from
+    ///         that transport origin. `lzCompose` accepts a call only if
+    ///         `OFTComposeMsgCodec.composeFrom(_message)` equals the entrypoint
+    ///         registered for the message's `srcEid`.
     ///
-    ///         Keyed by `bytes32` so the same registry works for EVM (address
-    ///         left-padded) and non-EVM source chains (full 32-byte address).
-    mapping(bytes32 entrypoint => bool trusted) public override trustedEntrypoints;
+    ///         `srcEid` is stamped by the LayerZero protocol (not by the payload
+    ///         author), so binding trust to it — instead of to a bare address —
+    ///         means an entrypoint trusted for one source chain cannot have its
+    ///         messages honoured as if they arrived from another, and trust no
+    ///         longer survives an address being reused/resurrected elsewhere.
+    ///
+    ///         Entrypoint stored as `bytes32` so the same registry works for EVM
+    ///         (address left-padded) and non-EVM source chains (full 32-byte
+    ///         address). `bytes32(0)` means "no trusted entrypoint for this
+    ///         srcEid". Maintained by federation governance via
+    ///         `setTrustedEntrypoint` (callable only by `multisigProxy`).
+    mapping(uint32 srcEid => bytes32 entrypoint) public override trustedEntrypoints;
+
+    /// @notice Expected business `sourceChainId` for each LayerZero `srcEid`.
+    ///         `lzCompose` requires the self-declared `sourceChainId` carried in
+    ///         the payload to equal this value. Because `sourceChainId` selects
+    ///         the destination route (settlement module + verifier) and the
+    ///         commission rule, pinning it to the transport origin stops a
+    ///         compromised/buggy entrypoint from declaring an arbitrary source
+    ///         chain for a real deposit. `0` means "unregistered srcEid".
+    ///         Set together with `trustedEntrypoints` via `setTrustedEntrypoint`.
+    mapping(uint32 srcEid => uint256 chainId) public override eidToChainId;
 
     /// @dev Records of inbound compose payloads whose `Bridge.fundsIn` call
     ///      reverted. Keyed by LayerZero compose guid (unique per packet).
@@ -162,24 +184,31 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
         if (msg.sender != endpoint) revert NotEndpoint();
         if (_from      != oft)      revert NotFromOft();
 
-        // 1. Reject any call whose source-chain `OFT.send` caller is not a
-        //    trusted entrypoint.
+        // 1. Bind trust to the LayerZero transport origin. `srcEid` is stamped by
+        //    the LayerZero protocol (not by the payload author) and is therefore
+        //    non-spoofable. Accept the packet only if its `composeFrom` matches
+        //    the single entrypoint registered for that `srcEid`; an unregistered
+        //    srcEid (expected == 0) is rejected.
+        uint32  srcEid_      = OFTComposeMsgCodec.srcEid(_message);
         bytes32 composeFrom_ = OFTComposeMsgCodec.composeFrom(_message);
-        if (!trustedEntrypoints[composeFrom_]) {
-            revert UntrustedComposeSource(composeFrom_);
+        bytes32 expected     = trustedEntrypoints[srcEid_];
+        if (expected == bytes32(0) || composeFrom_ != expected) {
+            revert UntrustedComposeSource(srcEid_, composeFrom_);
         }
 
         // 2. Decode the LayerZero compose data.
         uint256 amountLD     = OFTComposeMsgCodec.amountLD(_message);
         bytes memory payload = OFTComposeMsgCodec.composeMsg(_message);
 
-        // 3. Decode the business payload. `sourceChainId` is the EVM chain id
-        //    captured by `UtexoSourceEntrypoint` from `block.chainid` at deposit
-        //    time — non-spoofable. `settlementData` is an opaque blob whose
-        //    layout is dictated by the destination route's `SettlementModule`
-        //    on Arbitrum; the adapter plumbs it through unchanged. For routes
-        //    registered with `NullSettlementModule` (the default for
-        //    LZ-adapter inbound flows) it is empty.
+        // 3. Decode the business payload. `sourceChainId` is the EVM chain id the
+        //    source `UtexoSourceEntrypoint` captured from `block.chainid` at
+        //    deposit time, but it is self-declared in the payload — it is only
+        //    trustworthy once step 3a cross-checks it against the transport
+        //    `srcEid`. `settlementData` is an opaque blob whose layout is dictated
+        //    by the destination route's `SettlementModule` on Arbitrum; the
+        //    adapter plumbs it through unchanged. For routes registered with
+        //    `NullSettlementModule` (the default for LZ-adapter inbound flows) it
+        //    is empty.
         (
             uint256 sourceChainId,
             uint256 destinationChainId,
@@ -187,6 +216,15 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
             uint256 operationId,
             bytes memory settlementData
         ) = abi.decode(payload, (uint256, uint256, string, uint256, bytes));
+
+        // 3a. Bind the self-declared `sourceChainId` to the transport origin: the
+        //     trusted entrypoint for this `srcEid` may only speak for the chain id
+        //     registered to it. This turns `sourceChainId` — which drives route
+        //     and commission selection downstream — from a self-asserted field
+        //     into one corroborated by the LayerZero transport.
+        if (eidToChainId[srcEid_] != sourceChainId) {
+            revert SourceChainIdMismatch(srcEid_, sourceChainId);
+        }
 
         // 4. Approve Bridge to pull the USDT0 we just received via lzReceive.
         IERC20(token).safeIncreaseAllowance(bridge, amountLD);
@@ -372,14 +410,31 @@ contract UtexoLZAdapter is IUtexoLZAdapter, IOAppComposer, ReentrancyGuard {
     ///      mutating the trusted set is a deliberate federation decision —
     ///      e.g. adding a freshly deployed source-chain entrypoint, rotating
     ///      an entrypoint after redeploy, or revoking a compromised one.
-    function setTrustedEntrypoint(bytes32 entrypoint, bool trusted)
+    ///
+    ///      Registers (or revokes) the trusted entrypoint AND its expected
+    ///      business `sourceChainId` for a transport `srcEid` in one atomic
+    ///      write, so the two halves of the trust binding can never drift apart.
+    ///      Pass `entrypoint == bytes32(0)` to revoke a `srcEid` entirely.
+    function setTrustedEntrypoint(uint32 srcEid, bytes32 entrypoint, uint256 chainId)
         external
         override
         onlyMultisigProxy
     {
-        if (entrypoint == bytes32(0)) revert InvalidEntrypoint();
+        if (srcEid == 0) revert InvalidSrcEid();
 
-        trustedEntrypoints[entrypoint] = trusted;
-        emit TrustedEntrypointSet(entrypoint, trusted);
+        // Revoke: clear both halves of the binding for this srcEid.
+        if (entrypoint == bytes32(0)) {
+            delete trustedEntrypoints[srcEid];
+            delete eidToChainId[srcEid];
+            emit TrustedEntrypointSet(srcEid, bytes32(0), 0);
+            return;
+        }
+
+        // Register: an entrypoint must always be bound to a real business chain id.
+        if (chainId == 0) revert InvalidChainId();
+
+        trustedEntrypoints[srcEid] = entrypoint;
+        eidToChainId[srcEid]       = chainId;
+        emit TrustedEntrypointSet(srcEid, entrypoint, chainId);
     }
 }

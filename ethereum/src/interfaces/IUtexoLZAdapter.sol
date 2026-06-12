@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.35;
 
 /// @title IUtexoLZAdapter
 /// @notice Bidirectional adapter between the Utexo `Bridge` and the LayerZero / USDT0 stack
@@ -24,8 +24,8 @@ interface IUtexoLZAdapter {
     /// @param operationId         Backend-assigned operation id from `composeMsg`.
     /// @param sourceChainId       EVM chain id of the source chain, set by
     ///                            `UtexoSourceEntrypoint` from `block.chainid` at
-    ///                            deposit time. Non-spoofable for entrypoint-routed
-    ///                            deposits.
+    ///                            deposit time and cross-checked in `lzCompose`
+    ///                            against the transport `srcEid` via `eidToChainId`.
     /// @param destinationChainId  Final destination chain id (`uint256`): real
     ///                            `block.chainid` values for EVM legs, reserved
     ///                            namespace ids above the EVM range for non-EVM
@@ -54,7 +54,8 @@ interface IUtexoLZAdapter {
     error InvalidBridge();
     error InvalidMultisigProxy();
     error InvalidRecipient();
-    error InvalidEntrypoint();
+    error InvalidSrcEid();
+    error InvalidChainId();
 
     error NotEndpoint();
     error NotMultisigProxy();
@@ -65,7 +66,14 @@ interface IUtexoLZAdapter {
     error NativeRefundFailed();
 
     error NoStuckFunds(bytes32 guid);
-    error UntrustedComposeSource(bytes32 composeFrom);
+
+    /// @notice `lzCompose` caller is not the entrypoint registered for the
+    ///         message's transport `srcEid` (or the `srcEid` is unregistered).
+    error UntrustedComposeSource(uint32 srcEid, bytes32 composeFrom);
+
+    /// @notice The payload's self-declared `sourceChainId` does not match the
+    ///         chain id registered for the message's transport `srcEid`.
+    error SourceChainIdMismatch(uint32 srcEid, uint256 sourceChainId);
 
     // =========================================================================
     // Events
@@ -132,12 +140,15 @@ interface IUtexoLZAdapter {
         uint256 nativeValue
     );
 
-    /// @notice Emitted whenever the trusted-entrypoint set is mutated by
+    /// @notice Emitted whenever a trusted-source binding is mutated by
     ///         federation governance.
+    /// @param srcEid     LayerZero transport source id the binding applies to.
     /// @param entrypoint Source-chain entrypoint address as bytes32 (left-padded
-    ///                   for EVM, full 32 bytes for non-EVM chains).
-    /// @param trusted    New flag value.
-    event TrustedEntrypointSet(bytes32 indexed entrypoint, bool trusted);
+    ///                   for EVM, full 32 bytes for non-EVM chains). `bytes32(0)`
+    ///                   signals the binding was revoked.
+    /// @param chainId    Expected business `sourceChainId` for this `srcEid`
+    ///                   (`0` on revoke).
+    event TrustedEntrypointSet(uint32 indexed srcEid, bytes32 entrypoint, uint256 chainId);
 
     // =========================================================================
     // State views
@@ -149,8 +160,14 @@ interface IUtexoLZAdapter {
     function bridge()        external view returns (address);
     function multisigProxy() external view returns (address);
 
-    /// @notice Whether a source-chain entrypoint address is allowed to drive `lzCompose`.
-    function trustedEntrypoints(bytes32 entrypoint) external view returns (bool);
+    /// @notice The source-chain entrypoint (as bytes32) trusted to drive
+    ///         `lzCompose` for a given LayerZero transport `srcEid`.
+    ///         `bytes32(0)` means no entrypoint is registered for that srcEid.
+    function trustedEntrypoints(uint32 srcEid) external view returns (bytes32);
+
+    /// @notice The business `sourceChainId` expected for a given LayerZero
+    ///         transport `srcEid`. `0` means the srcEid is unregistered.
+    function eidToChainId(uint32 srcEid) external view returns (uint256);
 
     /// @notice Returns the stuck-funds record for a given LayerZero guid.
     ///         `amountLD == 0` signals "no record".
@@ -207,14 +224,19 @@ interface IUtexoLZAdapter {
     // Trusted entrypoint registry
     // =========================================================================
 
-    /// @notice Adds or removes a source-chain entrypoint from the trusted set.
-    ///         `lzCompose` requires the inbound packet's `composeFrom` (i.e. the
-    ///         `msg.sender` of the original `OFT.send` call on the source chain,
-    ///         preserved by the OFT protocol) to be in this set — otherwise the
-    ///         call reverts. Callable only by `multisigProxy`, so changes go
-    ///         through federation governance.
+    /// @notice Registers or revokes the trusted source binding for a LayerZero
+    ///         transport `srcEid`. `lzCompose` requires the inbound packet's
+    ///         `composeFrom` (the `msg.sender` of the original `OFT.send` on the
+    ///         source chain, preserved by the OFT protocol) to equal `entrypoint`
+    ///         AND the payload's self-declared `sourceChainId` to equal `chainId`
+    ///         — otherwise the call reverts. Both halves are written atomically.
+    ///         Callable only by `multisigProxy`, so changes go through federation
+    ///         governance.
+    /// @param srcEid     LayerZero transport source id this binding applies to. Non-zero.
     /// @param entrypoint Source-chain entrypoint address as bytes32 (left-padded
-    ///                   for EVM, full 32 bytes for non-EVM chains). Non-zero.
-    /// @param trusted    `true` to add, `false` to remove.
-    function setTrustedEntrypoint(bytes32 entrypoint, bool trusted) external;
+    ///                   for EVM, full 32 bytes for non-EVM chains). Pass
+    ///                   `bytes32(0)` to revoke the binding for `srcEid`.
+    /// @param chainId    Expected business `sourceChainId` for this `srcEid`.
+    ///                   Must be non-zero when registering (ignored on revoke).
+    function setTrustedEntrypoint(uint32 srcEid, bytes32 entrypoint, uint256 chainId) external;
 }
