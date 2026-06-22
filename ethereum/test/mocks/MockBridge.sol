@@ -22,6 +22,11 @@ contract MockBridge {
     /// Force `fundsIn` to revert — used by failure-path tests.
     bool public reverts;
 
+    /// Optional exact native value expectation — used to model Bridge native
+    /// commission mismatch without pulling in the real Bridge dependency.
+    bool public checksMsgValue;
+    uint256 public expectedMsgValue;
+
     // Last-call recording -----------------------------------------------------
     uint256 public lastAmount;
     uint256 public lastSourceChainId;
@@ -40,6 +45,11 @@ contract MockBridge {
         reverts = v;
     }
 
+    function setExpectedMsgValue(uint256 expected) external {
+        checksMsgValue  = true;
+        expectedMsgValue = expected;
+    }
+
     /// @notice Mirrors the adapter-only overload
     ///         `Bridge.fundsIn(uint256 amount, uint256 sourceChainId,
     ///                         uint256 destinationChainId, string destinationAddress,
@@ -53,6 +63,7 @@ contract MockBridge {
         bytes   calldata settlementData
     ) external payable {
         require(!reverts, 'MockBridge: forced revert');
+        require(!checksMsgValue || msg.value == expectedMsgValue, 'MockBridge: native value mismatch');
 
         IERC20(token).transferFrom(msg.sender, address(this), amount);
 
