@@ -11,6 +11,8 @@ import { IUtexoLZAdapter } from '../src/interfaces/IUtexoLZAdapter.sol';
 import { MockERC20 }  from './mocks/MockERC20.sol';
 import { MockOFT }    from './mocks/MockOFT.sol';
 import { MockBridge } from './mocks/MockBridge.sol';
+import { ZeroApprovalRevertingERC20 } from './mocks/ZeroApprovalRevertingERC20.sol';
+import { ZeroAmountBridge } from './mocks/ZeroAmountBridge.sol';
 
 /// @title UtexoLZAdapterTest
 /// @notice Verifies the inbound (`lzCompose` → `Bridge.fundsIn`) and outbound
@@ -1394,33 +1396,3 @@ contract UtexoLZAdapterTest is Test {
 ///      No `receive()` / `fallback()` is declared, so any value-carrying call
 ///      reverts.
 contract RejectingRecipient {}
-
-/// @dev Allows normal nonzero approvals but rejects zero approvals, which
-///      models a catch-cleanup failure in `UtexoLZAdapter.lzCompose`.
-contract ZeroApprovalRevertingERC20 is MockERC20 {
-    constructor() MockERC20('Bad USDT', 'BAD') {}
-
-    function approve(address spender, uint256 value) public override returns (bool) {
-        if (value == 0) revert('ZeroApprovalRevertingERC20: zero approval');
-        return super.approve(spender, value);
-    }
-}
-
-/// @dev Minimal Bridge-shaped mock that rejects zero amount like the real Bridge
-///      adapter overload does via its minimum-amount guard.
-contract ZeroAmountBridge {
-    error AmountBelowMinimum(uint256 amount, uint256 minimum);
-
-    function fundsIn(
-        uint256 amount,
-        uint256,
-        uint256,
-        string calldata,
-        uint256,
-        bytes calldata
-    ) external payable {
-        if (amount == 0) revert AmountBelowMinimum(0, 1);
-    }
-
-    receive() external payable {}
-}
